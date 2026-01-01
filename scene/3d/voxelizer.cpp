@@ -410,6 +410,17 @@ Voxelizer::BakeResult Voxelizer::plot_mesh(const Transform3D &p_xform, Ref<Mesh>
 
 	int bake_total = get_bake_steps(p_mesh), bake_current = 0;
 
+	// Check whether all surfaces have UV2 (required for bake_render_uv2)
+	bool mesh_has_uv2 = true;
+	for (int s = 0; s < p_mesh->get_surface_count(); s++) {
+		Array sa = p_mesh->surface_get_arrays(s);
+		Array uv2_arr = sa[Mesh::ARRAY_TEX_UV2];
+		if (uv2_arr.size() == 0) {
+			mesh_has_uv2 = false;
+			break;
+		}
+	}
+
 	for (int i = 0; i < p_mesh->get_surface_count(); i++) {
 		if (p_mesh->surface_get_primitive_type(i) != Mesh::PRIMITIVE_TRIANGLES) {
 			continue; //only triangles
@@ -424,13 +435,88 @@ Voxelizer::BakeResult Voxelizer::plot_mesh(const Transform3D &p_xform, Ref<Mesh>
 		} else {
 			src_material = p_mesh->surface_get_material(i);
 		}
-		MaterialCache material = _get_material_cache(src_material);
+		MaterialCache material;
+		bool material_is_baked = false;
 
 		Array a = p_mesh->surface_get_arrays(i);
 
+		// If material (or override) is a ShaderMaterial and the mesh has UV2, try a GPU bake per-surface
+		Ref<ShaderMaterial> sm;
+		if (p_override_material.is_valid()) {
+			sm = Ref<ShaderMaterial>(p_override_material);
+		} else {
+			sm = Ref<ShaderMaterial>(src_material);
+		}
+		if (sm.is_valid() && mesh_has_uv2) {
+			// Build overrides array for a per-surface bake (override applied to all surfaces, or per-surface materials)
+			TypedArray<RID> overrides;
+			overrides.resize(p_mesh->get_surface_count());
+			// Only set the target surface's override so the bake corresponds to that surface's material
+			for (int s = 0; s < overrides.size(); s++) {
+				overrides[s] = RID();
+			}
+			if (p_override_material.is_valid()) {
+				RID rid_override = p_override_material->get_rid();
+				overrides[i] = rid_override;
+			} else {
+				Ref<Material> m;
+				if (i < p_materials.size() && p_materials[i].is_valid()) {
+					m = p_materials[i];
+				} else {
+					m = p_mesh->surface_get_material(i);
+				}
+				overrides[i] = m.is_valid() ? m->get_rid() : RID();
+			}
+
+			String cache_key = String::num_uint64(p_mesh->get_rid().get_id()) + ":" + itos(bake_texture_size) + ":" + rtos(exposure_normalization) + ":";
+			for (int s = 0; s < overrides.size(); s++) {
+				RID r = overrides[s];
+				cache_key += String::num_uint64(r.get_id());
+				if (s + 1 < overrides.size()) {
+					cache_key += ",";
+				}
+			}
+
+			if (baked_mesh_cache.has(cache_key)) {
+				material = baked_mesh_cache[cache_key];
+				material_is_baked = true;
+			} else {
+				TypedArray<Image> images = RS::get_singleton()->bake_render_uv2(p_mesh->get_rid(), overrides, Size2i(bake_texture_size * 4, bake_texture_size * 4));
+				if (!images.is_empty()) {
+					Ref<Image> albedo_img;
+					Ref<Image> emission_img;
+					if (images.size() > RS::BAKE_CHANNEL_ALBEDO_ALPHA) {
+						albedo_img = images[RS::BAKE_CHANNEL_ALBEDO_ALPHA];
+					}
+					if (images.size() > RS::BAKE_CHANNEL_EMISSION) {
+						emission_img = images[RS::BAKE_CHANNEL_EMISSION];
+					}
+
+					if (albedo_img.is_valid()) {
+						material.albedo = _get_bake_texture(albedo_img, Color(1, 1, 1), Color(0, 0, 0));
+					} else {
+						Ref<Image> empty;
+						material.albedo = _get_bake_texture(empty, Color(0, 0, 0), Color(1, 1, 1));
+					}
+
+					if (emission_img.is_valid()) {
+						material.emission = _get_bake_texture(emission_img, Color(1, 1, 1) * exposure_normalization, Color(0, 0, 0));
+					} else {
+						Ref<Image> empty;
+						material.emission = _get_bake_texture(empty, Color(0, 0, 0), Color(0, 0, 0));
+					}
+
+					baked_mesh_cache[cache_key] = material;
+					material_is_baked = true;
+				}
+			}
+		} else {
+			material = _get_material_cache(src_material);
+		}
+
 		Vector<Vector3> vertices = a[Mesh::ARRAY_VERTEX];
 		const Vector3 *vr = vertices.ptr();
-		Vector<Vector2> uv = a[Mesh::ARRAY_TEX_UV];
+		Vector<Vector2> uv = material_is_baked ? a[Mesh::ARRAY_TEX_UV2] : a[Mesh::ARRAY_TEX_UV];
 		const Vector2 *uvr = nullptr;
 		Vector<Vector3> normals = a[Mesh::ARRAY_NORMAL];
 		const Vector3 *nr = nullptr;
@@ -667,6 +753,7 @@ void Voxelizer::begin_bake(int p_subdiv, const AABB &p_bounds, float p_exposure_
 	exposure_normalization = p_exposure_normalization;
 	bake_cells.resize(1);
 	material_cache.clear();
+	baked_mesh_cache.clear();
 
 	//find out the actual real bounds, power of 2, which gets the highest subdivision
 	po2_bounds = p_bounds;

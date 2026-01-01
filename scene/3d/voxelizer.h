@@ -93,6 +93,7 @@ private:
 	};
 
 	HashMap<Ref<Material>, MaterialCache> material_cache;
+	HashMap<String, MaterialCache> baked_mesh_cache;
 	float exposure_normalization = 1.0;
 	AABB original_bounds;
 	AABB po2_bounds;
